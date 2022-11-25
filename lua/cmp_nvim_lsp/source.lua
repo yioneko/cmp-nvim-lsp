@@ -79,9 +79,17 @@ source.resolve = function(self, completion_item, callback)
     return callback()
   end
 
-  self:_request('completionItem/resolve', completion_item, function(_, response)
-    callback(response or completion_item)
-  end)
+  self:_request(
+    'completionItem/resolve',
+    completion_item,
+    -- here we use completion_item as fallback, because we should never trigger a second request
+    -- cmp will not retrigger resolve if a non-nil value is returned from callback
+    function(_, response)
+      callback(response or completion_item)
+    end,
+    -- but if the request is cancelled, we should retriggger it if a second resolve is requested
+    callback
+  )
 end
 
 ---Execute LSP CompletionItem.
@@ -122,21 +130,32 @@ end
 ---@param method string
 ---@param params table
 ---@param callback function
-source._request = function(self, method, params, callback)
+---@param cancel function|nil
+source._request = function(self, method, params, callback, cancel)
+  cancel = cancel or callback
+
   if self.request_ids[method] ~= nil then
     self.client.cancel_request(self.request_ids[method])
     self.request_ids[method] = nil
   end
-  local _, request_id
-  _, request_id = self.client.request(method, params, function(arg1, arg2, arg3)
+  local success, request_id
+  success, request_id = self.client.request(method, params, function(arg1, arg2, arg3)
     if self.request_ids[method] ~= request_id then
-      return
+      -- We want to distinguish between
+      -- 1. resolved: a result returned from server or an error
+      -- 2. cancelled: the client cancelled it, meaning that re-request should be possible
+      return cancel()
     end
     self.request_ids[method] = nil
 
     -- Text changed, retry
     if arg1 and arg1.code == -32801 then
-      self:_request(method, params, callback)
+      local success, new_request_id = self:_request(method, params, callback)
+      if success then
+        self.request_ids[method] = new_request_id
+      else
+        callback()
+      end
       return
     end
 
@@ -146,7 +165,13 @@ source._request = function(self, method, params, callback)
       callback(arg1, arg2) -- new signature
     end
   end)
-  self.request_ids[method] = request_id
+
+  if success then
+    self.request_ids[method] = request_id
+  else
+    -- the callback is called asyncronously in this function
+    vim.defer_fn(callback, 0)
+  end
 end
 
 return source
